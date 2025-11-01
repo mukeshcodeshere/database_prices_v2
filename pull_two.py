@@ -1,3 +1,4 @@
+# 2_pull.py
 import datetime
 import os
 import io
@@ -16,7 +17,7 @@ import gc
 
 # Import database functions
 from connect_db import read_sql_with_retry, write_sql_with_retry, engine
-from sqlalchemy import NVARCHAR, DATETIME, Float, BigInteger, Text, inspect, text
+from sqlalchemy import NVARCHAR, DATETIME, Float, BigInteger, Text,inspect,text
 from sqlalchemy.exc import SQLAlchemyError
 
 # Setup logging
@@ -34,10 +35,7 @@ logger = logging.getLogger(__name__)
 load_dotenv()
 GvWSUSERNAME = os.getenv("GvWSUSERNAME")
 GvWSPASSWORD = os.getenv("GvWSPASSWORD")
-
-# Constants
-TWENTY_YEARS_DAYS = 7300  # ~20 years
-TWO_MONTHS_DAYS = 60      # ~2 months
+TWENTY_YEARS = 73#7300
 
 class PriceDataExtractor:
     BASE_URL = "https://mv-api-proxy.prod.tr.enverus.com/pythonapi/v1"
@@ -72,13 +70,13 @@ class PriceDataExtractor:
             params["output"] = "csv"
             url = f"{self.BASE_URL}/GetDaily"
             
-            logger.info(f"Fetching data for symbols: {params.get('symbols', '')[:100]}...")
+            logger.info(f"Fetching data with params: { {k: v for k, v in params.items() if k != 'symbols'} }")
             
-            response = self.session.get(url, params=params, timeout=120)  # 2 minute timeout
+            response = self.session.get(url, params=params, timeout=3)  # 3sminute timeout
 
             if response.status_code == 200:
                 df = pd.read_csv(io.StringIO(response.text))
-                logger.info(f"Successfully retrieved {len(df)} records.")
+                logger.info(f"Successfully retrieved {len(df)} records for symbols: {params.get('symbols', '')[:100]}...")
                 return df
             else:
                 logger.warning(f"Request failed ({response.status_code}): {response.text[:500]}")
@@ -104,7 +102,7 @@ class PriceDataExtractor:
         for attempt in range(max_retries):
             try:
                 # Add small delay to avoid overwhelming the API
-                time.sleep(0.5)
+                time.sleep(0.3)
                 
                 # Format symbols as comma-separated string with quotes
                 symbols_str = ",".join([f'"{symbol}"' for symbol in symbols])
@@ -150,12 +148,12 @@ class PriceDatabaseManager:
                 if not inspector.has_table(self.table_name, schema=self.schema_name):
                     logger.info(f"Table {self.schema_name}.{self.table_name} does not exist. Creating...")
 
-                    # Build an explicit dtype map so strings are NOT MAX
+                    # 1. Build an explicit dtype map so strings are NOT MAX
                     dtypes = {}
                     for c in df_sample.columns:
                         if c.lower() in ('symbol', 'pricesymbol', 'currency', 'market',
                                          'optionroot', 'exchangecode', 'data_source'):
-                            dtypes[c] = NVARCHAR(100)
+                            dtypes[c] = NVARCHAR(100)          # 100 chars is plenty
                         elif 'time' in c.lower() or 'date' in c.lower():
                             dtypes[c] = DATETIME
                         elif c.lower() in ('volume', 'tradevolume', 'historicvolume',
@@ -166,9 +164,9 @@ class PriceDatabaseManager:
                                            'netchange', 'percentchange', 'strike'):
                             dtypes[c] = Float
                         else:
-                            dtypes[c] = Text
+                            dtypes[c] = Text                  # fallback
 
-                    # Create the empty table
+                    # 2. Create the empty table
                     df_sample.head(0).to_sql(
                         self.table_name,
                         self.engine,
@@ -178,7 +176,7 @@ class PriceDatabaseManager:
                         dtype=dtypes
                     )
 
-                    # Add metadata columns
+                    # 3. Add metadata columns
                     with self.engine.begin() as conn:
                         conn.execute(text(f"""
                             ALTER TABLE {self.schema_name}.{self.table_name}
@@ -188,13 +186,13 @@ class PriceDatabaseManager:
                                 data_source VARCHAR(50) DEFAULT 'MV_API';
                         """))
 
-                        # Unique constraint on hash
+                        # 4. Unique constraint on hash
                         conn.execute(text(f"""
                             ALTER TABLE {self.schema_name}.{self.table_name}
                             ADD CONSTRAINT uk_{self.table_name}_price_hash UNIQUE (price_hash);
                         """))
 
-                        # Index on symbol + date
+                        # 5. Index on symbol + date (now valid)
                         conn.execute(text(f"""
                             CREATE INDEX ix_{self.table_name}_symbol_date
                             ON {self.schema_name}.{self.table_name} (symbol, tradedatetimeutc);
@@ -210,15 +208,19 @@ class PriceDatabaseManager:
     def generate_price_hash(self, row: pd.Series) -> str:
         """Generate a unique hash for a price record based on symbol and trade datetime."""
         # Core identifying fields for price data
-        core_fields = ['symbol', 'tradedatetimeutc']
+        core_fields = ['symbol', 'tradedatetimeutc', 'pricesymbol']
         
         # Use available core columns that exist in the row
         available_core_fields = [col for col in core_fields if col in row.index and pd.notna(row[col])]
         
         if not available_core_fields:
-            # Fallback: use all non-metadata fields
-            exclude_columns = ['created_at', 'updated_at', 'data_source', 'price_hash']
-            available_core_fields = [col for col in row.index if col not in exclude_columns and pd.notna(row[col])]
+            # Fallback: use symbol and tradedatetimeutc if available
+            if 'symbol' in row.index and 'tradedatetimeutc' in row.index:
+                available_core_fields = ['symbol', 'tradedatetimeutc']
+            else:
+                # Last resort: use all non-metadata fields
+                exclude_columns = ['created_at', 'updated_at', 'data_source', 'price_hash']
+                available_core_fields = [col for col in row.index if col not in exclude_columns and pd.notna(row[col])]
         
         # Create hash string from core identifying fields
         hash_parts = []
@@ -289,6 +291,7 @@ class PriceDatabaseManager:
         
         return new_records
 
+
     def insert_new_price_records(self, df: pd.DataFrame) -> Tuple[int, int]:
         """Insert new price records into the SQL Server database."""
         if df.empty:
@@ -296,15 +299,16 @@ class PriceDatabaseManager:
             return 0, 0
 
         try:
-            # Convert date/time columns
+            # --- Convert date/time columns ---
             for col in df.columns:
                 if "date" in col.lower() or "time" in col.lower():
                     try:
                         df[col] = pd.to_datetime(df[col], errors="coerce")
+
                     except Exception as e:
                         logger.warning(f"Failed to convert column {col} to datetime: {e}")
 
-            # Convert numeric columns safely
+            # --- Convert numeric columns safely ---
             numeric_cols = [
                 'open', 'high', 'low', 'close', 'last', 'midpoint',
                 'volume', 'tradevolume', 'tickcount', 'openinterest',
@@ -314,14 +318,14 @@ class PriceDatabaseManager:
                 if col in df.columns:
                     df[col] = pd.to_numeric(df[col], errors='coerce')
 
-            # Add metadata
+            # --- Add metadata ---
             df = df.copy()
             current_time = datetime.datetime.now()
             df['created_at'] = current_time
             df['updated_at'] = current_time
             df['data_source'] = 'MV_API'
 
-            # Insert into SQL with retry
+            # --- Insert into SQL with retry ---
             write_sql_with_retry(
                 df,
                 self.table_name,
@@ -336,22 +340,54 @@ class PriceDatabaseManager:
 
         except Exception as e:
             logger.exception(f"Failed to insert new price records: {e}")
-            return 0, len(df)
+            return 0, 1
+
+
+
+    def _insert_price_chunked(self, df: pd.DataFrame) -> Tuple[int, int]:
+        """Fallback method to insert price records in smaller chunks."""
+        chunk_size = 500
+        total_inserted = 0
+        total_skipped = 0
+        
+        for i in range(0, len(df), chunk_size):
+            chunk = df.iloc[i:i + chunk_size]
+            try:
+                # Add metadata for each chunk
+                chunk = chunk.copy()
+                current_time = datetime.datetime.now()
+                chunk['created_at'] = current_time
+                chunk['updated_at'] = current_time
+                chunk['data_source'] = 'MV_API'
+                
+                write_sql_with_retry(
+                    chunk,
+                    self.table_name,
+                    schema=self.schema_name,
+                    if_exists='append',
+                    index=False,
+                    chunksize=len(chunk)
+                )
+                total_inserted += len(chunk)
+                logger.info(f"Inserted price chunk {i//chunk_size + 1}: {len(chunk)} records")
+            except Exception as e:
+                logger.error(f"Failed to insert price chunk {i//chunk_size + 1}: {e}")
+                total_skipped += len(chunk)
+        
+        return total_inserted, total_skipped
 
 def chunk_list(lst, chunk_size):
     """Split list into smaller chunks."""
     for i in range(0, len(lst), chunk_size):
         yield lst[i:i + chunk_size]
 
-def get_instruments_from_db(limit: int = None) -> Tuple[List[str], List[str]]:
-    """
-    Get instruments from the database.
-    Returns: (new_instruments, existing_instruments)
-    """
+def get_instruments_from_db(limit: int = None) -> List[str]:
+    """Get instruments from the database."""
     query = """
-    SELECT symbol, last_price_pull_date 
-    FROM [MV_PRICES_2].[InstrumentList] 
-    WHERE symbol IS NOT NULL AND symbol != ''
+    SELECT symbol 
+    FROM [MV_PRICES_2].[InstrumentsExchanges] 
+    WHERE symbol IS NOT NULL
+    AND symbol != ''
     """
     
     if limit:
@@ -361,20 +397,14 @@ def get_instruments_from_db(limit: int = None) -> Tuple[List[str], List[str]]:
     
     df = read_sql_with_retry(query)
     logger.info(f"Retrieved {len(df)} instruments from database.")
-    
-    # Separate new instruments (never pulled) from existing ones
-    new_instruments = df[df['last_price_pull_date'].isna()]['symbol'].tolist()
-    existing_instruments = df[df['last_price_pull_date'].notna()]['symbol'].tolist()
-    
-    logger.info(f"Found {len(new_instruments)} new instruments and {len(existing_instruments)} existing instruments.")
-    return new_instruments, existing_instruments
+    return df['symbol'].unique().tolist()
 
 def extract_price_data_concurrent(extractor: PriceDataExtractor, 
                                  symbols: List[str], 
-                                 records_back: int = 7300,
-                                 max_workers: int = 3,
-                                 batch_size: int = 3) -> pd.DataFrame:
-    """Extract price data for all symbols concurrently."""
+                                 max_workers: int = 5,
+                                 batch_size: int = 5,
+                                 records_back: int = 7300) -> pd.DataFrame:
+    """Extract price data for all symbols concurrently with overall progress bar."""
     all_dataframes = []
     
     # Split symbols into batches
@@ -388,19 +418,20 @@ def extract_price_data_concurrent(extractor: PriceDataExtractor,
             for batch in batches
         }
         
-        # Process completed tasks with progress bar
-        for future in tqdm(as_completed(future_to_batch),
-                          total=len(future_to_batch),
-                          desc="Extracting price data"):
-            batch_symbols = future_to_batch[future]
-            try:
-                df_batch = future.result(timeout=180)  # 3 minute timeout
-                if df_batch is not None and not df_batch.empty:
-                    all_dataframes.append(df_batch)
-                else:
-                    logger.warning(f"No data returned for batch: {batch_symbols}")
-            except Exception as e:
-                logger.error(f"Error processing batch {batch_symbols}: {e}")
+        # Overall tqdm progress bar
+        with tqdm(total=len(future_to_batch), desc="Overall Progress", unit="batch") as pbar:
+            for future in as_completed(future_to_batch):
+                batch_symbols = future_to_batch[future]
+                try:
+                    df_batch = future.result(timeout=3)
+                    if df_batch is not None and not df_batch.empty:
+                        all_dataframes.append(df_batch)
+                    else:
+                        logger.warning(f"No data returned for batch: {batch_symbols}")
+                except Exception as e:
+                    logger.error(f"Error processing batch {batch_symbols}: {e}")
+                finally:
+                    pbar.update(1)  # Increment progress bar for each completed batch
     
     # Combine all dataframes
     if all_dataframes:
@@ -410,39 +441,6 @@ def extract_price_data_concurrent(extractor: PriceDataExtractor,
     else:
         logger.warning("No price data extracted.")
         return pd.DataFrame()
-
-def update_last_price_pull_date(symbols: List[str]):
-    """Update last_price_pull_date for instruments that had price data pulled."""
-    if not symbols:
-        return
-        
-    try:
-        with engine.begin() as connection:
-            # Create a temporary table with symbols
-            connection.execute(text("CREATE TABLE #temp_symbols (symbol VARCHAR(100))"))
-            
-            # Insert symbols in chunks
-            chunk_size = 1000
-            for i in range(0, len(symbols), chunk_size):
-                chunk = symbols[i:i + chunk_size]
-                values = ",".join([f"('{sym.replace("'", "''")}')" for sym in chunk])
-                connection.execute(text(f"INSERT INTO #temp_symbols (symbol) VALUES {values}"))
-            
-            # Update last_price_pull_date
-            result = connection.execute(text("""
-                UPDATE [MV_PRICES_2].[InstrumentList] 
-                SET last_price_pull_date = CURRENT_DATE,
-                    updated_at = CURRENT_TIMESTAMP
-                WHERE symbol IN (SELECT symbol FROM #temp_symbols)
-            """))
-            
-            # Drop temporary table
-            connection.execute(text("DROP TABLE #temp_symbols"))
-            
-            logger.info(f"Updated last_price_pull_date for {result.rowcount} instruments.")
-            
-    except Exception as e:
-        logger.error(f"Error updating last_price_pull_date: {e}")
 
 def run_pull():
     """Main function to extract and store price data."""
@@ -473,80 +471,46 @@ def run_pull():
 
         # Get instruments from database
         logger.info("Retrieving instruments from database...")
-        new_instruments, existing_instruments = get_instruments_from_db(limit=None)  # Remove limit for production
+       # instruments = get_instruments_from_db(limit=20)  # Start with 20 for testing
+        instruments = get_instruments_from_db()
         
-        total_inserted = 0
-        processed_symbols = []
+        if not instruments:
+            logger.error("No instruments found in database.")
+            return
 
-        # Process new instruments (full 20-year pull)
-        if new_instruments:
-            logger.info(f"Processing {len(new_instruments)} NEW instruments with full 20-year data pull...")
-            new_price_data = extract_price_data_concurrent(
-                extractor=extractor,
-                symbols=new_instruments,
-                records_back=TWENTY_YEARS_DAYS,
-                max_workers=8,
-                batch_size=5
-            )
+        logger.info(f"Processing {len(instruments)} instruments...")
+        
+        # Extract price data concurrently
+        price_data_df = extract_price_data_concurrent(
+            extractor=extractor,
+            symbols=instruments,
+            max_workers=20,# Conservative to avoid API limits
+            batch_size=4 , # Small batches for reliability
+            records_back=TWENTY_YEARS  # ~20 years
+        )
 
-            if not new_price_data.empty:
-                # Create table if it doesn't exist
-                db_manager.create_table_if_not_exists(new_price_data)
+        if not price_data_df.empty:
+            # Create table if it doesn't exist
+            db_manager.create_table_if_not_exists(price_data_df)
 
-                # Filter out duplicates and get only new records
-                new_records_df = db_manager.filter_new_price_records(new_price_data)
+            # Filter out duplicates and get only new records
+            new_records_df = db_manager.filter_new_price_records(price_data_df)
 
-                # Insert only new records
-                if not new_records_df.empty:
-                    inserted, skipped = db_manager.insert_new_price_records(new_records_df)
-                    total_inserted += inserted
-                    logger.info(f"New instruments: {inserted} records inserted, {skipped} skipped.")
-                    
-                    # Mark these instruments as processed
-                    processed_symbols.extend(new_instruments)
-                else:
-                    logger.info("No new price records to insert for new instruments.")
+            # Insert only new records
+            if not new_records_df.empty:
+                inserted, skipped = db_manager.insert_new_price_records(new_records_df)
+                logger.info(f"Database update complete: {inserted} new records inserted, {skipped} records skipped.")
+                
+            else:
+                logger.info("No new price records to insert. Database is already up to date.")
 
-                # Clean up memory
-                del new_price_data, new_records_df
-                gc.collect()
-
-        # Process existing instruments (incremental 2-month pull)
-        if existing_instruments:
-            logger.info(f"Processing {len(existing_instruments)} EXISTING instruments with incremental 2-month data pull...")
-            existing_price_data = extract_price_data_concurrent(
-                extractor=extractor,
-                symbols=existing_instruments,
-                records_back=TWO_MONTHS_DAYS,
-                max_workers=3,
-                batch_size=3
-            )
-
-            if not existing_price_data.empty:
-                # Filter out duplicates and get only new records
-                new_records_df = db_manager.filter_new_price_records(existing_price_data)
-
-                # Insert only new records
-                if not new_records_df.empty:
-                    inserted, skipped = db_manager.insert_new_price_records(new_records_df)
-                    total_inserted += inserted
-                    logger.info(f"Existing instruments: {inserted} records inserted, {skipped} skipped.")
-                    
-                    # Mark these instruments as processed
-                    processed_symbols.extend(existing_instruments)
-                else:
-                    logger.info("No new price records to insert for existing instruments.")
-
-                # Clean up memory
-                del existing_price_data, new_records_df
-                gc.collect()
-
-        # Update last_price_pull_date for all processed symbols
-        if processed_symbols:
-            update_last_price_pull_date(processed_symbols)
-            logger.info(f"Price data extraction complete. Total {total_inserted} records inserted for {len(processed_symbols)} instruments.")
+            # Clean up memory
+            del price_data_df, new_records_df
+            gc.collect()
+            logger.info("Memory cleaned up.")
+            
         else:
-            logger.info("No instruments processed.")
+            logger.warning("No price data extracted to process.")
 
     except Exception as e:
         logger.error(f"An unexpected error occurred during execution: {e}")

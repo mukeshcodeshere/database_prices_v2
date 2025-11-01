@@ -72,7 +72,7 @@ class PriceDataExtractor:
             
             logger.info(f"Fetching data with params: { {k: v for k, v in params.items() if k != 'symbols'} }")
             
-            response = self.session.get(url, params=params, timeout=120)  # 2 minute timeout
+            response = self.session.get(url, params=params, timeout=3)  # 3sminute timeout
 
             if response.status_code == 200:
                 df = pd.read_csv(io.StringIO(response.text))
@@ -404,7 +404,7 @@ def extract_price_data_concurrent(extractor: PriceDataExtractor,
                                  max_workers: int = 5,
                                  batch_size: int = 5,
                                  records_back: int = 7300) -> pd.DataFrame:
-    """Extract price data for all symbols concurrently."""
+    """Extract price data for all symbols concurrently with overall progress bar."""
     all_dataframes = []
     
     # Split symbols into batches
@@ -418,19 +418,20 @@ def extract_price_data_concurrent(extractor: PriceDataExtractor,
             for batch in batches
         }
         
-        # Process completed tasks with progress bar
-        for future in tqdm(as_completed(future_to_batch),
-                          total=len(future_to_batch),
-                          desc="Extracting price data"):
-            batch_symbols = future_to_batch[future]
-            try:
-                df_batch = future.result(timeout=180)  # 3 minute timeout for 20 years of data
-                if df_batch is not None and not df_batch.empty:
-                    all_dataframes.append(df_batch)
-                else:
-                    logger.warning(f"No data returned for batch: {batch_symbols}")
-            except Exception as e:
-                logger.error(f"Error processing batch {batch_symbols}: {e}")
+        # Overall tqdm progress bar
+        with tqdm(total=len(future_to_batch), desc="Overall Progress", unit="batch") as pbar:
+            for future in as_completed(future_to_batch):
+                batch_symbols = future_to_batch[future]
+                try:
+                    df_batch = future.result(timeout=3)
+                    if df_batch is not None and not df_batch.empty:
+                        all_dataframes.append(df_batch)
+                    else:
+                        logger.warning(f"No data returned for batch: {batch_symbols}")
+                except Exception as e:
+                    logger.error(f"Error processing batch {batch_symbols}: {e}")
+                finally:
+                    pbar.update(1)  # Increment progress bar for each completed batch
     
     # Combine all dataframes
     if all_dataframes:
@@ -470,7 +471,8 @@ def run_pull():
 
         # Get instruments from database
         logger.info("Retrieving instruments from database...")
-        instruments = get_instruments_from_db(limit=20)  # Start with 20 for testing
+       # instruments = get_instruments_from_db(limit=20)  # Start with 20 for testing
+        instruments = get_instruments_from_db()
         
         if not instruments:
             logger.error("No instruments found in database.")
@@ -482,8 +484,8 @@ def run_pull():
         price_data_df = extract_price_data_concurrent(
             extractor=extractor,
             symbols=instruments,
-            max_workers=3,  # Conservative to avoid API limits
-            batch_size=3,   # Small batches for reliability
+            max_workers=20,# Conservative to avoid API limits
+            batch_size=4 , # Small batches for reliability
             records_back=TWENTY_YEARS  # ~20 years
         )
 

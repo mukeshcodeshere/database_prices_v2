@@ -349,7 +349,8 @@ def cleanup_old_logs():
 
 def run_script_with_logging(func, name):
     """Run a function and log its output to a timestamped file."""
-    timestamp = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    timestamp = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%d_%H%M%S")
+
     log_path = SUBPROCESS_LOG_DIR / f"{name}_{timestamp}.log"
 
     logger.info(f"Starting '{name}', logging to {log_path}")
@@ -381,9 +382,8 @@ def daily_job():
 
 # ---------------- Scheduler ----------------
 scheduler = BackgroundScheduler()
-daily_trigger = CronTrigger(hour=20, minute=51, second=0, timezone='UTC')  # Daily 20:51 UTC
+daily_trigger = CronTrigger(hour=22, minute=40, second=0, timezone='UTC')  # Daily 17:40pm (houston / 22 40 utc
 scheduler.add_job(daily_job, daily_trigger, id='daily_job')
-logger.info("Daily job scheduled at 20:51 UTC.")
 
 scheduler.start()
 logger.info("Scheduler started.")
