@@ -20,8 +20,17 @@ from pathlib import Path
 UTC_TIMEZONE = pytz.UTC
 
 # Schedule time (in UTC)
-SCHEDULE_HOUR = 23  # 18:30 Houston
-SCHEDULE_MINUTE = 30
+# SCHEDULE_HOUR = 23  # 18:30 Houston
+# SCHEDULE_MINUTE = 30
+
+# SCHEDULE_HOUR = 20  # 15:30 Houston
+# SCHEDULE_MINUTE = 38
+
+now_utc = datetime.now(timezone.utc)
+SCHEDULE_HOUR = now_utc.hour
+SCHEDULE_MINUTE = now_utc.minute
+print(SCHEDULE_HOUR)
+print(SCHEDULE_MINUTE)
 
 # Directories
 BASE_DIR = Path(__file__).parent.resolve()
@@ -33,13 +42,8 @@ LOG_RETENTION_DAYS = 7
 
 # Scripts to run
 SCRIPTS_TO_RUN = [
-    SCRIPT_DIR / 'NEW_0_create_ticker_list.py',
-    SCRIPT_DIR / 'NEW_1_populate_ticker_table_PROD.py',
-    SCRIPT_DIR / 'NEW2_dropdown_creator.py',
-    SCRIPT_DIR / 'new2_concurrent_pull.py',
-    SCRIPT_DIR / 'NEW7_Backwards Adjustment_Process.py',
-    SCRIPT_DIR / 'NEW4_spread_tables_fullhistory.py',
-    SCRIPT_DIR / 'NEW5_copy_data_to_dev.py',
+    SCRIPT_DIR / '1_tickers.py',
+    SCRIPT_DIR / '2_pull.py',
 ]
 
 # --- Utility Functions ---------------------------------------------
