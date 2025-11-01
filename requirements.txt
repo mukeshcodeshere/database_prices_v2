@@ -1,0 +1,20 @@
+# Python 3.13
+pandas==2.3.0
+numpy==2.2.6
+python-dotenv==1.1.0
+pandas_market_calendars==5.1.0
+statsmodels==0.14.4
+scipy==1.15.3
+plotly==6.1.2
+gunicorn==23.0.0
+sqlalchemy==2.0.41
+pyodbc==5.2.0
+requests==2.32.3
+urllib3==2.4.0  # This is part of `requests` dependency
+schedule==1.2.2
+tqdm==4.67.1
+pytz==2025.2
+tenacity==9.1.2
+apscheduler==3.11.0
+xlsxwriter==3.2.5
+python-dateutil==2.8.1

@@ -1,0 +1,27 @@
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+*.env
+*.yml
+*.env.*
+*.DS_Store
+*.egg-info
+*.pytest_cache
+dist
+build
+.eggs
+.vscode
+.idea
+.git
+.gitignore
+Dockerfile
+docker-compose.yml
+azuresteps.md
+README.md
+
+# Ignore all .txt files
+*.txt
+
+# But include requirements.txt - ORDER MATTERS
+!requirements.txt
