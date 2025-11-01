@@ -441,7 +441,7 @@ def extract_price_data_concurrent(extractor: PriceDataExtractor,
         logger.warning("No price data extracted.")
         return pd.DataFrame()
 
-def main():
+def run_pull():
     """Main function to extract and store price data."""
     if not GvWSUSERNAME or not GvWSPASSWORD:
         logger.error("Username or password not found in environment variables.")
@@ -514,4 +514,4 @@ def main():
         logger.error(f"An unexpected error occurred during execution: {e}")
 
 if __name__ == "__main__":
-    main()
+    run_pull()

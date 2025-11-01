@@ -424,7 +424,7 @@ class DatabaseManager:
         return total_inserted, total_skipped
 
 
-def main():
+def run_tickers():
     # Load credentials
 
     load_dotenv()
@@ -493,4 +493,4 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    run_tickers()
