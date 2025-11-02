@@ -24,18 +24,17 @@ from collections import defaultdict
 
 # ============================================================================
 # CONFIGURATION PARAMETERS - MODIFY THESE AS NEEDED
-# ============================================================================
-MAX_WORKERS = 2                     # Number of concurrent threads for API calls
-MAX_EXCHANGES_PER_CYCLE = None       # None = all exchanges, or set int for testing
-BATCH_SIZE = 100                     # Records per database insert batch
-SMALL_BATCH_SIZE = 10                # Smaller batch for error recovery
-SLEEP_BETWEEN_CYCLES = 300           # Seconds between full refresh cycles (5 min)
-API_TIMEOUT = 5                    # Timeout for API requests in seconds
-MAX_API_RETRIES = 3                  # Maximum retry attempts for failed API calls
-MEMORY_CLEANUP_FREQUENCY = 10        # Run gc.collect() every N exchanges
-SCHEMA_NAME = "MV_PRICES_2"          # Database schema name
-TABLE_NAME = "InstrumentList"        # Database table name
-LOG_LEVEL = logging.INFO             # Logging level (DEBUG, INFO, WARNING, ERROR)
+# ==========================================================================
+MAX_WORKERS = 1                     # Number of concurrent threads for API calls
+MAX_EXCHANGES_PER_CYCLE = 6#None      # None = all exchanges, or set int for testing
+BATCH_SIZE = 100                    # Records per database insert batch
+SMALL_BATCH_SIZE = 10               # Smaller batch for error recovery
+API_TIMEOUT = 3                    # Timeout for API requests in seconds
+MAX_API_RETRIES = 3                 # Maximum retry attempts for failed API calls
+MEMORY_CLEANUP_FREQUENCY = 10       # Run gc.collect() every N exchanges
+SCHEMA_NAME = "MV_PRICES_2"         # Database schema name
+TABLE_NAME = "InstrumentList"       # Database table name
+LOG_LEVEL = logging.INFO            # Logging level (DEBUG, INFO, WARNING, ERROR)
 
 # ============================================================================
 # LOGGING SETUP
@@ -189,7 +188,7 @@ class MarketDataExtractor:
     def get_exchange_list(self) -> Optional[pd.DataFrame]:
         """Get list of all available exchanges."""
         params = {}
-        df = self._fetch_csv("getExchangeList", params)
+        df = self._fetch_csv("getExchangeList", params, timeout=60)  # Longer timeout for exchange list
         if df is not None and not df.empty:
             logger.info(f"Retrieved {len(df)} exchanges")
             return df
@@ -221,7 +220,7 @@ class MarketDataExtractor:
                 "exchangecode": exchange_code,
                 "recordsback": records_back
             }
-            df = self._fetch_csv("symbolSearchByExchange", params, timeout=API_TIMEOUT)
+            df = self._fetch_csv("symbolSearchByExchange", params, timeout=30)  # 30 second timeout
             if df is not None and not df.empty:
                 # Add exchange_code column if not present
                 if 'exchange_code' not in df.columns:
@@ -235,56 +234,6 @@ class MarketDataExtractor:
             logger.error(f"Error getting symbols for {exchange_code}: {e}")
             logger.error(traceback.format_exc())
             return None
-
-    def extract_all_exchange_instruments(self, max_workers: int = MAX_WORKERS, 
-                                        max_exchanges: Optional[int] = MAX_EXCHANGES_PER_CYCLE) -> Dict[str, pd.DataFrame]:
-        """Extract instruments from all exchanges with concurrent processing."""
-        exchange_codes = self.get_exchange_codes()
-        if not exchange_codes:
-            logger.error("No exchange codes found - possible authentication issue")
-            return {}
-
-        if max_exchanges:
-            exchange_codes = exchange_codes[:max_exchanges]
-            logger.info(f"Limited to {max_exchanges} exchanges")
-
-        logger.info(f"Processing {len(exchange_codes)} exchanges with {max_workers} workers")
-
-        results = {}
-        successful = 0
-        failed = 0
-        
-        with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = {
-                executor.submit(self.get_symbols_for_exchange, code): code
-                for code in exchange_codes
-            }
-            
-            with tqdm(total=len(futures), desc=" Extracting Instruments", unit="exchange") as pbar:
-                for future in as_completed(futures):
-                    code = futures[future]
-                    try:
-                        df = future.result(timeout=API_TIMEOUT + 10)
-                        if df is not None and not df.empty:
-                            results[code] = df
-                            successful += 1
-                            pbar.set_postfix({"✓": successful, "✗": failed, "current": code})
-                        else:
-                            failed += 1
-                            pbar.set_postfix({"✓": successful, "✗": failed, "current": code})
-                    except Exception as e:
-                        logger.error(f"Error processing {code}: {e}")
-                        failed += 1
-                        pbar.set_postfix({"✓": successful, "✗": failed, "current": code})
-                    finally:
-                        pbar.update(1)
-                        
-                        # Periodic memory cleanup
-                        if (successful + failed) % MEMORY_CLEANUP_FREQUENCY == 0:
-                            gc.collect()
-        
-        logger.info(f"Extraction complete: {successful} successful, {failed} failed")
-        return results
 
     def get_stats(self) -> dict:
         """Return statistics about API usage."""
@@ -616,17 +565,16 @@ class DatabaseManager:
             return 0
 
 # ============================================================================
-# STREAMING PIPELINE
+# STREAMING PIPELINE - SINGLE CYCLE WITH BATCHED PULL/PUSH
 # ============================================================================
 class StreamingPipeline:
-    """Continuous streaming pipeline with robust error handling."""
+    """Pipeline that pulls and pushes in batches simultaneously in ONE cycle."""
     
     def __init__(self, username: str, password: str):
         self.username = username
         self.password = password
         self.extractor = MarketDataExtractor(username, password)
         self.db_manager = DatabaseManager(SCHEMA_NAME, TABLE_NAME)
-        self.cycle_count = 0
         self.total_inserted = 0
         self.total_failed = 0
         self.start_time = datetime.datetime.now()
@@ -635,7 +583,7 @@ class StreamingPipeline:
         """Initialize database schema and table."""
         try:
             logger.info("=" * 80)
-            logger.info("INITIALIZING STREAMING PIPELINE")
+            logger.info("INITIALIZING PIPELINE")
             logger.info("=" * 80)
             
             if not self.db_manager.ensure_schema_exists():
@@ -659,155 +607,119 @@ class StreamingPipeline:
             logger.error(traceback.format_exc())
             return False
     
-    def process_cycle(self) -> Tuple[int, int]:
-        """Process a single data extraction and insertion cycle."""
+    def run_single_cycle(self) -> None:
+        """
+        Run ONE cycle: pull all tickers from exchanges and push only new ones to DB.
+        Uses concurrent extraction with batched inserts as data becomes available.
+        """
         cycle_start = time.time()
-        self.cycle_count += 1
         
         logger.info("=" * 80)
-        logger.info(f"STARTING CYCLE #{self.cycle_count}")
+        logger.info("STARTING SINGLE CYCLE")
         logger.info("=" * 80)
         
         try:
-            # Extract data
-            logger.info(f"🔄 Extracting instruments with {MAX_WORKERS} workers...")
-            exchange_instruments = self.extractor.extract_all_exchange_instruments(
-                max_workers=MAX_WORKERS,
-                max_exchanges=MAX_EXCHANGES_PER_CYCLE
-            )
+            # Get exchange codes
+            exchange_codes = self.extractor.get_exchange_codes()
+            if not exchange_codes:
+                logger.error("No exchange codes found - possible authentication issue")
+                return
+
+            if MAX_EXCHANGES_PER_CYCLE:
+                exchange_codes = exchange_codes[:MAX_EXCHANGES_PER_CYCLE]
+                logger.info(f"Limited to {MAX_EXCHANGES_PER_CYCLE} exchanges")
+
+            logger.info(f"Processing {len(exchange_codes)} exchanges with {MAX_WORKERS} workers")
+
+            # Process exchanges concurrently and insert as we go
+            successful = 0
+            failed = 0
             
-            if not exchange_instruments:
-                logger.warning("No data extracted in this cycle")
-                return 0, 0
+            with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+                # Submit all extraction tasks
+                futures = {
+                    executor.submit(self.extractor.get_symbols_for_exchange, code): code
+                    for code in exchange_codes
+                }
+                
+                with tqdm(total=len(futures), desc="Extracting & Inserting", unit="exchange") as pbar:
+                    for future in as_completed(futures):
+                        code = futures[future]
+                        try:
+                            # Get data for this exchange (increased timeout)
+                            df = future.result(timeout=60)  # 60 second timeout for future
+                            
+                            if df is not None and not df.empty:
+                                # Immediately prepare and insert this exchange's data
+                                prepared_df = self.db_manager.prepare_data_for_insert(df)
+                                inserted, failed_records = self.db_manager.insert_records(prepared_df)
+                                
+                                self.total_inserted += inserted
+                                self.total_failed += failed_records
+                                
+                                successful += 1
+                                pbar.set_postfix({
+                                    "✓": successful, 
+                                    "✗": failed, 
+                                    "inserted": self.total_inserted,
+                                    "current": code
+                                })
+                                
+                                # Clean up memory
+                                del df, prepared_df
+                                
+                            else:
+                                failed += 1
+                                pbar.set_postfix({
+                                    "✓": successful, 
+                                    "✗": failed,
+                                    "inserted": self.total_inserted,
+                                    "current": code
+                                })
+                                
+                        except Exception as e:
+                            logger.error(f"Error processing {code}: {e}")
+                            failed += 1
+                            pbar.set_postfix({
+                                "✓": successful, 
+                                "✗": failed,
+                                "inserted": self.total_inserted,
+                                "current": code
+                            })
+                        finally:
+                            pbar.update(1)
+                            
+                            # Periodic memory cleanup
+                            if (successful + failed) % MEMORY_CLEANUP_FREQUENCY == 0:
+                                gc.collect()
             
-            # Combine DataFrames
-            logger.info("🔗 Combining exchange data...")
-            combined_df = pd.concat(exchange_instruments.values(), ignore_index=True)
-            logger.info(f"Combined: {len(combined_df)} records from {len(exchange_instruments)} exchanges")
-            
-            # Clear exchange data from memory
-            del exchange_instruments
+            # Final cleanup
             gc.collect()
-            
-            # Prepare data
-            logger.info("🔧 Preparing data for insertion...")
-            prepared_df = self.db_manager.prepare_data_for_insert(combined_df)
-            
-            # Clear combined data from memory
-            del combined_df
-            gc.collect()
-            
-            # Insert records
-            logger.info("💾 Inserting records into database...")
-            inserted, failed = self.db_manager.insert_records(prepared_df)
-            
-            # Clear prepared data from memory
-            del prepared_df
-            gc.collect()
-            
-            # Update totals
-            self.total_inserted += inserted
-            self.total_failed += failed
             
             # Cycle summary
             cycle_duration = time.time() - cycle_start
             logger.info("=" * 80)
-            logger.info(f"CYCLE #{self.cycle_count} COMPLETE")
+            logger.info("CYCLE COMPLETE")
             logger.info(f"  Duration: {cycle_duration:.2f} seconds")
-            logger.info(f"  Inserted: {inserted} records")
-            logger.info(f"  Failed: {failed} records")
+            logger.info(f"  Exchanges Processed: {successful}")
+            logger.info(f"  Exchanges Failed: {failed}")
+            logger.info(f"  New Records Inserted: {self.total_inserted}")
+            logger.info(f"  Records Failed: {self.total_failed}")
             logger.info(f"  Total DB Records: {self.db_manager.get_record_count()}")
             logger.info("=" * 80)
             
-            return inserted, failed
-            
         except Exception as e:
-            logger.error(f"✗ Error in cycle #{self.cycle_count}: {e}")
+            logger.error(f"✗ Error in cycle: {e}")
             logger.error(traceback.format_exc())
-            return 0, 0
-    
-    def run_continuous(self, max_cycles: Optional[int] = None) -> None:
-        """Run continuous streaming pipeline."""
-        logger.info("=" * 80)
-        logger.info("🚀 STARTING CONTINUOUS STREAMING PIPELINE")
-        logger.info("=" * 80)
-        logger.info(f"Configuration:")
-        logger.info(f"  Max Workers: {MAX_WORKERS}")
-        logger.info(f"  Batch Size: {BATCH_SIZE}")
-        logger.info(f"  Cycle Sleep: {SLEEP_BETWEEN_CYCLES}s")
-        logger.info(f"  Schema: {SCHEMA_NAME}")
-        logger.info(f"  Table: {TABLE_NAME}")
-        if max_cycles:
-            logger.info(f"  Max Cycles: {max_cycles}")
-        else:
-            logger.info(f"  Max Cycles: Unlimited (Ctrl+C to stop)")
-        logger.info("=" * 80)
-        
-        try:
-            cycle_num = 0
-            while True:
-                # Check if we've reached max cycles
-                if max_cycles and cycle_num >= max_cycles:
-                    logger.info(f"✓ Reached maximum cycles ({max_cycles})")
-                    break
-                
-                # Process cycle
-                try:
-                    inserted, failed = self.process_cycle()
-                    cycle_num += 1
-                    
-                    # Print overall statistics
-                    runtime = datetime.datetime.now() - self.start_time
-                    logger.info(f" Overall Statistics:")
-                    logger.info(f"  Runtime: {runtime}")
-                    logger.info(f"  Cycles: {self.cycle_count}")
-                    logger.info(f"  Total Inserted: {self.total_inserted}")
-                    logger.info(f"  Total Failed: {self.total_failed}")
-                    logger.info(f"  DB Records: {self.db_manager.get_record_count()}")
-                    
-                    # API statistics
-                    api_stats = self.extractor.get_stats()
-                    logger.info(f"  API Requests: {api_stats['total_requests']}")
-                    if api_stats['failed_endpoints']:
-                        logger.info(f"  Failed Endpoints: {len(api_stats['failed_endpoints'])}")
-                    
-                except Exception as e:
-                    logger.error(f"✗ Error in cycle: {e}")
-                    logger.error(traceback.format_exc())
-                
-                # Check if we should continue
-                if max_cycles and cycle_num >= max_cycles:
-                    break
-                
-                # Sleep between cycles
-                logger.info(f"⏸  Sleeping for {SLEEP_BETWEEN_CYCLES} seconds...")
-                logger.info("=" * 80)
-                time.sleep(SLEEP_BETWEEN_CYCLES)
-                
-                # Periodic memory cleanup
-                if cycle_num % 5 == 0:
-                    logger.info("🧹 Running memory cleanup...")
-                    gc.collect()
-                
-        except KeyboardInterrupt:
-            logger.info("\n" + "=" * 80)
-            logger.info(" KEYBOARD INTERRUPT - SHUTTING DOWN GRACEFULLY")
-            logger.info("=" * 80)
-        except Exception as e:
-            logger.error(f"✗ Fatal error in pipeline: {e}")
-            logger.error(traceback.format_exc())
-        finally:
-            self.print_final_summary()
     
     def print_final_summary(self) -> None:
         """Print final pipeline summary."""
         runtime = datetime.datetime.now() - self.start_time
         
         logger.info("=" * 80)
-        logger.info(" FINAL PIPELINE SUMMARY")
+        logger.info("FINAL SUMMARY")
         logger.info("=" * 80)
         logger.info(f"Total Runtime: {runtime}")
-        logger.info(f"Total Cycles: {self.cycle_count}")
         logger.info(f"Records Inserted: {self.total_inserted}")
         logger.info(f"Records Failed: {self.total_failed}")
         logger.info(f"Final DB Count: {self.db_manager.get_record_count()}")
@@ -828,14 +740,14 @@ class StreamingPipeline:
             logger.info(f"Average Insert Rate: {rate:.2f} records/second")
         
         logger.info("=" * 80)
-        logger.info("✓ PIPELINE SHUTDOWN COMPLETE")
+        logger.info("✓ PIPELINE COMPLETE")
         logger.info("=" * 80)
 
 # ============================================================================
 # MAIN EXECUTION
 # ============================================================================
-def run_tickers(max_cycles: Optional[int] = None):
-    """Main entry point for the streaming pipeline."""
+def run_tickers():
+    """Main entry point for the pipeline - runs ONE cycle."""
     try:
         # Load environment variables
         load_dotenv()
@@ -858,9 +770,16 @@ def run_tickers(max_cycles: Optional[int] = None):
             logger.error("✗ Pipeline initialization failed")
             return
         
-        # Run continuous pipeline
-        pipeline.run_continuous(max_cycles=max_cycles)
+        # Run single cycle with continuous pull/push
+        pipeline.run_single_cycle()
         
+        # Print summary
+        pipeline.print_final_summary()
+        
+    except KeyboardInterrupt:
+        logger.info("\n" + "=" * 80)
+        logger.info(" KEYBOARD INTERRUPT - SHUTTING DOWN")
+        logger.info("=" * 80)
     except Exception as e:
         logger.error("=" * 80)
         logger.error("✗ FATAL ERROR")
@@ -869,48 +788,8 @@ def run_tickers(max_cycles: Optional[int] = None):
         logger.error(traceback.format_exc())
         logger.error("=" * 80)
 
-def run_single_cycle():
-    """Run a single extraction cycle (for testing)."""
-    try:
-        load_dotenv()
-        username = os.getenv("GvWSUSERNAME")
-        password = os.getenv("GvWSPASSWORD")
-
-        if not username or not password:
-            logger.error("Authentication credentials not found")
-            return
-
-        pipeline = StreamingPipeline(username, password)
-        
-        if pipeline.initialize():
-            pipeline.process_cycle()
-            pipeline.print_final_summary()
-        
-    except Exception as e:
-        logger.error(f"Error in single cycle: {e}")
-        logger.error(traceback.format_exc())
-
 # ============================================================================
-# ENTRY POINT – default to a single cycle
+# ENTRY POINT
 # ============================================================================
 if __name__ == "__main__":
-    import sys
-
-    if len(sys.argv) > 1:
-        arg = sys.argv[1].lower()
-        if arg == "test":
-            run_single_cycle()          # kept for backward compatibility
-        elif arg == "continuous":
-            run_tickers(max_cycles=None)  # unlimited if user explicitly asks
-        elif arg.isdigit():
-            run_tickers(max_cycles=int(arg))
-        else:
-            print("Usage:")
-            print("  python tickers_one.py           # run 1 cycle (default)")
-            print("  python tickers_one.py test      # same as 1 cycle")
-            print("  python tickers_one.py 10        # run 10 cycles")
-            print("  python tickers_one.py continuous # run forever")
-    else:
-        # DEFAULT: exactly one cycle
-        logger.info("No argument supplied – running single cycle (default).")
-        run_tickers(max_cycles=1)
+    run_tickers()

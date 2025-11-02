@@ -94,7 +94,7 @@ def daily_job():
 
 # ---------------- Scheduler ----------------
 scheduler = BackgroundScheduler()
-daily_trigger = CronTrigger(hour=23,minute=55, second=0, timezone='UTC')  # Daily 17:40pm (houston / 22 40 utc
+daily_trigger = CronTrigger(hour=13,minute=55,second=0, timezone='UTC')  # Daily 17:40pm (houston / 22 40 utc
 scheduler.add_job(daily_job, daily_trigger, id='daily_job')
 
 scheduler.start()
